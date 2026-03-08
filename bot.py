@@ -101,7 +101,9 @@ def build_ffmpeg_opts(bass: bool = False, nightcore: bool = False,
     filters.append(f"volume={volume / 100:.2f}")
 
     af_str = ",".join(filters) if filters else None
-    options = "-vn" + (f' -af "{af_str}"' if af_str else "")
+    # НЕ оборачиваем af в кавычки — FFmpegPCMAudio передаёт аргументы напрямую
+    # в subprocess, а не через shell, поэтому кавычки ломают команду
+    options = "-vn" + (f" -af {af_str}" if af_str else "")
 
     return {
         "before_options": FFMPEG_RECONNECT,
@@ -197,6 +199,33 @@ async def fetch_info(query: str, playlist: bool = False) -> dict | None:
         return None
 
 
+async def get_stream_url(track: dict) -> str | None:
+    """Получает свежий прямой URL стрима прямо перед воспроизведением.
+    URL из yt-dlp истекает через ~30 сек — нельзя хранить в очереди."""
+    source_url = track.get("webpage_url") or track.get("original_url")
+    if not source_url:
+        # Если нет webpage_url — используем то, что есть (для прямых URL)
+        return track.get("url")
+
+    opts = {
+        **YDL_BASE_OPTS,
+        "noplaylist": True,
+        "extract_flat": False,
+    }
+    loop = asyncio.get_event_loop()
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = await loop.run_in_executor(
+                None, lambda: ydl.extract_info(source_url, download=False)
+            )
+        if info:
+            entry = info["entries"][0] if "entries" in info else info
+            return entry.get("url")
+    except Exception as e:
+        print(f"[get_stream_url] {e}")
+    return None
+
+
 async def fetch_spotify(url: str) -> list[str]:
     """Возвращает список строк '<artist> <title>' для поиска на YT."""
     if not sp:
@@ -285,8 +314,12 @@ async def play_next(guild_id: int):
     )
 
     try:
-        url = track.get("url") or track.get("webpage_url")
-        source = discord.FFmpegPCMAudio(url, **ffmpeg_opts)
+        # Переполучаем свежий stream URL — старый из yt-dlp истекает быстро
+        stream_url = await get_stream_url(track)
+        if not stream_url:
+            raise ValueError("Не удалось получить URL стрима")
+
+        source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts)
 
         def _after(err):
             if err:
@@ -465,10 +498,23 @@ async def cmd_play(ctx: commands.Context, *, query: str):
 
         # ── Плейлист ─────────────────────────────────────
         elif "playlist" in query or "list=" in query:
-            info = await fetch_info(query, playlist=True)
+            opts_pl = {**YDL_BASE_OPTS, "noplaylist": False, "extract_flat": "in_playlist"}
+            loop = asyncio.get_event_loop()
+            try:
+                with yt_dlp.YoutubeDL(opts_pl) as ydl:
+                    info = await loop.run_in_executor(
+                        None, lambda: ydl.extract_info(query, download=False)
+                    )
+            except Exception as e:
+                info = None
+                print(f"[playlist] {e}")
             if info and "entries" in info:
                 for entry in info["entries"]:
                     if entry:
+                        # Для flat-записей нет stream URL — только метаданные
+                        # get_stream_url будет использовать webpage_url/url при воспроизведении
+                        if not entry.get("webpage_url") and entry.get("url"):
+                            entry["webpage_url"] = entry["url"]
                         st.queue.append(entry)
                         added += 1
             await ctx.send(embed=discord.Embed(
